@@ -1331,3 +1331,173 @@ function Get-VersionPSObject
 
 
 #Export-ModuleMember -Function Compare-SemVer
+
+$script:LocalPath="$env:LOCALAPPDATA\Contoso\$script:ProviderName"
+$script:RegisteredPackageSourcesFilePath = Microsoft.PowerShell.Management\Join-Path -Path $script:LocalPath -ChildPath "MyAlbumPackageSource.xml"
+$script:RegisteredPackageSources = $null
+# Wildcard pattern matching configuration
+$script:wildcardOptions = [System.Management.Automation.WildcardOptions]::CultureInvariant -bor `
+                          [System.Management.Automation.WildcardOptions]::IgnoreCase
+                          
+function Resolve-PackageSource
+{
+    Write-Debug ("Resolve-PackageSource")      
+    $SourceName = $request.PackageSources
+
+    # get Sources from the registered config file
+    Set-PackageSourcesVariable
+
+    if(-not $SourceName)
+    {
+        $SourceName = "*"
+    }
+
+    foreach($src in $SourceName)
+    {
+        if($request.IsCanceled) { return }
+
+        # Get the sources that registered before
+        $wildcardPattern = New-Object System.Management.Automation.WildcardPattern $src,$script:wildcardOptions
+        $sourceFound = $false
+
+        $script:RegisteredPackageSources.GetEnumerator() |
+            Microsoft.PowerShell.Core\Where-Object {$wildcardPattern.IsMatch($_.Key)} |
+                Microsoft.PowerShell.Core\ForEach-Object {
+                    $source = $script:RegisteredPackageSources[$_.Key]
+                    $packageSource = New-PackageSourceAndYield -Source $source
+                    Write-Output -InputObject $packageSource
+                    $sourceFound = $true
+                }
+
+        # If a user does specify -Source but not registered
+        if(-not $sourceFound)
+        {
+            Write-Error -Message "Package source not found" -ErrorId "PackageSourceNotFound" -Category InvalidOperation -TargetObject $src
+            break
+        }
+    }
+}
+
+# Utility function - Read the registered package sources from its configuration file
+function Set-PackageSourcesVariable
+{
+    if(-not $script:RegisteredPackageSources)
+    {
+        if(Microsoft.PowerShell.Management\Test-Path $script:RegisteredPackageSourcesFilePath)
+        {
+            $script:RegisteredPackageSources = Import-Clixml -Path $script:RegisteredPackageSourcesFilePath
+        }
+        else
+        {
+            $script:RegisteredPackageSources = [ordered]@{}
+        }
+    }   
+}
+
+# Utility function - Yield the package source to OneGet
+function New-PackageSourceAndYield
+{
+    param
+    (
+        [Parameter(Mandatory)]
+        $Source
+    )
+
+    # create a new package source
+    $src =  New-PackageSource -Name $Source.Name `
+                              -Location $Source.SourceLocation `
+                              -Trusted $Source.Trusted `
+                              -Registered $Source.Registered `
+
+    # return the package source object.
+    Write-Output -InputObject $src
+}
+
+function Add-PackageSource
+{
+    [CmdletBinding()]
+    param
+    (
+        [string]
+        $Name,
+
+        [string]
+        $Location,
+
+        [bool]
+        $Trusted
+    )     
+
+    Write-Debug ("Add-PackageSource")  
+    Set-PackageSourcesVariable -Force  
+
+    # Add new package source
+    $packageSource = Microsoft.PowerShell.Utility\New-Object PSCustomObject -Property ([ordered]@{
+            Name = $Name
+            SourceLocation = $Location.TrimEnd("\")
+            Trusted=$Trusted
+            Registered= $true          
+        })    
+
+    $script:RegisteredPackageSources.Add($Name, $packageSource)   
+
+    # yield the package source to OneGet
+    Write-Verbose "$packageSource"
+
+    # Persist the package sources
+    Save-PackageSources
+
+    # yield the package source to OneGet
+    Write-Output -InputObject (New-PackageSourceAndYield -Source $packageSource)
+}
+
+# Utility function - save the package source to the configuration file
+function Save-PackageSources
+{
+    if($script:RegisteredPackageSources)
+    {
+        if(-not (Microsoft.PowerShell.Management\Test-Path $script:LocalPath))
+        {
+            $null = Microsoft.PowerShell.Management\New-Item `
+                    -Path $script:LocalPath `
+                    -ItemType Directory `
+                    -Force `
+                    -ErrorAction SilentlyContinue `
+                    -WarningAction SilentlyContinue `
+                    -Confirm:$false -WhatIf:$false
+        }
+
+        Microsoft.PowerShell.Utility\Export-Clixml `
+            -Path $script:RegisteredPackageSourcesFilePath `
+            -Force `
+            -InputObject ($script:RegisteredPackageSources)
+   }   
+}
+
+function Remove-PackageSource
+{
+    param
+    (
+        [string]
+        $Name
+    )
+
+    Write-Debug ('Remove-PackageSource')
+
+    Set-PackageSourcesVariable -Force
+
+    if (-not $script:RegisteredPackageSources.Contains($Name))
+    {
+        Write-Error -Message "Package $Name not found" -ErrorId "PackageSourceNotFound" -Category InvalidOperation -TargetObject $Name
+        return
+    }
+
+    $source = $script:RegisteredPackageSources[$Name]
+
+    #Remove it from memory cache
+    $script:RegisteredPackageSources.Remove($Name)
+
+    Write-Verbose "$source"
+    # Persist the package sources
+    Save-PackageSources        
+}
